@@ -84,6 +84,7 @@ impl Default for TransferConfig {
 pub struct ConfigStore {
     config_path: PathBuf,
     ssh_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl ConfigStore {
@@ -97,6 +98,7 @@ impl ConfigStore {
         Ok(Self {
             config_path: dirs.config_dir().join("config.toml"),
             ssh_dir: home.join(".ssh").join("fpsxterm-tui"),
+            state_dir: dirs.state_dir().unwrap_or(dirs.config_dir()).to_path_buf(),
         })
     }
 
@@ -105,6 +107,9 @@ impl ConfigStore {
     }
     pub fn ssh_dir(&self) -> &std::path::Path {
         &self.ssh_dir
+    }
+    pub fn history_path(&self) -> PathBuf {
+        self.state_dir.join("history.toml")
     }
     pub fn managed_hosts_path(&self) -> PathBuf {
         self.ssh_dir.join("hosts.conf")
@@ -148,6 +153,7 @@ mod tests {
         let store = ConfigStore {
             config_path: dir.path().join("config.toml"),
             ssh_dir: dir.path().join(".ssh/fpsxterm-tui"),
+            state_dir: dir.path().join("state"),
         };
         let config = store.load().unwrap();
         assert_eq!(config.terminal.editor, ["nano"]);

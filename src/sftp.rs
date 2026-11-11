@@ -75,6 +75,20 @@ impl RemoteFs {
         Ok(entries)
     }
 
+    pub async fn read_file(&mut self, path: &Path) -> Result<String> {
+        let mut input = self.sftp.open(path).await.context("opening remote file")?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = input.read(64 * 1024, bytes::BytesMut::new()).await? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                input.close().await?;
+                bail!("viewer limit is 2 MiB");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        input.close().await?;
+        String::from_utf8(bytes).context("file is not valid UTF-8 text")
+    }
+
     pub async fn create_dir(&mut self, parent: &Path, name: &str) -> Result<()> {
         let path = safe_child(parent, name)?;
         self.sftp

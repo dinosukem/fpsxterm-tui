@@ -40,6 +40,10 @@ pub enum RuntimeEvent {
         side: crate::app::FilePanel,
         message: Result<String, String>,
     },
+    FilePreviewLoaded {
+        title: String,
+        content: Result<String, String>,
+    },
 }
 
 struct TerminalSession {
@@ -291,6 +295,7 @@ impl TerminalManager {
             RuntimeEvent::TransferProgress { .. } => {}
             RuntimeEvent::TransferStarted { .. } => {}
             RuntimeEvent::FileOperationFinished { .. } => {}
+            RuntimeEvent::FilePreviewLoaded { .. } => {}
         }
     }
 

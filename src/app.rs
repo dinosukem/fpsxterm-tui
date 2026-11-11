@@ -1,7 +1,10 @@
+use anyhow::Context;
 use portable_pty::PtySize;
 use ratatui::layout::Rect;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -18,16 +21,24 @@ pub enum Screen {
     Terminal,
     Files,
     Transfers,
+    History,
 }
 
 impl Screen {
-    pub const ALL: [Self; 4] = [Self::Hosts, Self::Terminal, Self::Files, Self::Transfers];
+    pub const ALL: [Self; 5] = [
+        Self::Hosts,
+        Self::Terminal,
+        Self::Files,
+        Self::Transfers,
+        Self::History,
+    ];
     pub fn title(self) -> &'static str {
         match self {
             Self::Hosts => "Hosts",
             Self::Terminal => "Terminal",
             Self::Files => "Files",
             Self::Transfers => "Transfers",
+            Self::History => "History",
         }
     }
 }
@@ -60,7 +71,29 @@ pub struct TransferRecord {
     pub state: String,
     pub bytes: u64,
     pub total_bytes: Option<u64>,
+    pub source: String,
+    pub destination: String,
+    pub file_path: PathBuf,
+    pub started_at: SystemTime,
+    pub elapsed: Instant,
+    pub duration: Duration,
     cancel: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: u64,
+    pub alias: String,
+    pub at_unix: u64,
+    pub status: String,
+    #[serde(skip)]
+    pub session_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct HistoryFile {
+    #[serde(default)]
+    entries: Vec<HistoryEntry>,
 }
 
 impl FileManagerState {
@@ -114,6 +147,18 @@ pub enum FileModal {
     ConfirmOverwrite {
         side: FilePanel,
         entry: crate::filesystem::FileEntry,
+        rename: String,
+        rename_touched: bool,
+        choice: usize,
+    },
+    Viewer {
+        title: String,
+        content: String,
+        offset: usize,
+    },
+    ContextMenu {
+        side: FilePanel,
+        choice: usize,
     },
     PathInput {
         side: FilePanel,
@@ -191,6 +236,7 @@ pub enum HostModal {
 
 pub struct App {
     pub screen: Screen,
+    pub recent_screens: VecDeque<Screen>,
     pub focus: FocusTarget,
     pub config: AppConfig,
     pub should_quit: bool,
@@ -199,13 +245,20 @@ pub struct App {
     pub hosts: Vec<SshHost>,
     pub host_store: HostStore,
     pub host_modal: Option<HostModal>,
+    pub history: Vec<HistoryEntry>,
+    pub selected_history: usize,
+    history_path: PathBuf,
     pub terminals: TerminalManager,
     pub runtime_tx: mpsc::Sender<RuntimeEvent>,
     pub terminal_size: PtySize,
     pub terminal_rect: Rect,
+    pub viewport: Rect,
     pub files: FileManagerState,
     pub file_modal: Option<FileModal>,
+    pub last_file_click: Option<(Instant, u16, u16)>,
     pub transfers: Vec<TransferRecord>,
+    pub selected_transfer: usize,
+    pub rename_transfer_target: Option<String>,
     next_transfer_id: u64,
     overwrite_confirmed: bool,
     transfer_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
@@ -217,6 +270,7 @@ impl App {
         runtime_tx: mpsc::Sender<RuntimeEvent>,
         host_store: HostStore,
         hosts: Vec<SshHost>,
+        history_path: PathBuf,
     ) -> Self {
         let terminals = TerminalManager::new(config.terminal.scrollback_lines);
         let transfer_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -224,6 +278,7 @@ impl App {
         ));
         Self {
             screen: Screen::Hosts,
+            recent_screens: VecDeque::from([Screen::Hosts]),
             focus: FocusTarget::HostList,
             config,
             should_quit: false,
@@ -232,13 +287,20 @@ impl App {
             hosts,
             host_store,
             host_modal: None,
+            history: read_history(&history_path),
+            selected_history: 0,
+            history_path,
             terminals,
             runtime_tx,
             terminal_size: PtySize::default(),
             terminal_rect: Rect::default(),
+            viewport: Rect::default(),
             files: FileManagerState::new(),
             file_modal: None,
+            last_file_click: None,
             transfers: Vec::new(),
+            selected_transfer: 0,
+            rename_transfer_target: None,
             next_transfer_id: 0,
             overwrite_confirmed: false,
             transfer_semaphore,
@@ -247,6 +309,49 @@ impl App {
 
     pub fn set_terminal_rect(&mut self, rect: Rect) {
         self.terminal_rect = rect;
+    }
+    pub fn set_viewport(&mut self, rect: Rect) {
+        self.viewport = rect;
+    }
+
+    fn add_history(&mut self, alias: String, status: String, session_id: Option<u64>) {
+        let id = self.history.iter().map(|entry| entry.id).max().unwrap_or(0) + 1;
+        self.history.insert(
+            0,
+            HistoryEntry {
+                id,
+                alias,
+                at_unix: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                status,
+                session_id,
+            },
+        );
+        self.history.truncate(1000);
+        self.selected_history = 0;
+        self.save_history();
+    }
+
+    fn save_history(&self) {
+        let Some(parent) = self.history_path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(data) = toml::to_string_pretty(&HistoryFile {
+            entries: self.history.clone(),
+        }) else {
+            return;
+        };
+        let Ok(temp) = tempfile::NamedTempFile::new_in(parent) else {
+            return;
+        };
+        if std::fs::write(temp.path(), data).is_ok() {
+            let _ = temp.persist(&self.history_path);
+        }
     }
 
     pub fn select_terminal_index(&mut self, index: usize) {
@@ -272,6 +377,18 @@ impl App {
 
     pub fn process_runtime_event(&mut self, event: RuntimeEvent) {
         match event {
+            RuntimeEvent::ReaderClosed { session_id } => {
+                if let Some(item) = self
+                    .history
+                    .iter_mut()
+                    .find(|item| item.session_id == Some(session_id) && item.status == "Started")
+                {
+                    item.status = "Session ended".into();
+                    self.save_history();
+                }
+                self.terminals
+                    .process_event(RuntimeEvent::ReaderClosed { session_id });
+            }
             RuntimeEvent::FilesLoaded {
                 side,
                 path,
@@ -329,6 +446,16 @@ impl App {
                     }
                 }
             }
+            RuntimeEvent::FilePreviewLoaded { title, content } => match content {
+                Ok(content) => {
+                    self.file_modal = Some(FileModal::Viewer {
+                        title,
+                        content,
+                        offset: 0,
+                    })
+                }
+                Err(error) => self.status = format!("Could not view remote file: {error}"),
+            },
             RuntimeEvent::TransferFinished { id, result } => {
                 if let Some(transfer) = self.transfers.iter_mut().find(|transfer| transfer.id == id)
                 {
@@ -336,9 +463,11 @@ impl App {
                         Ok(bytes) => {
                             transfer.state = "Completed".into();
                             transfer.bytes = bytes;
+                            transfer.duration = transfer.elapsed.elapsed();
                             self.status = format!("{} completed ({} bytes)", transfer.label, bytes);
                         }
                         Err(error) => {
+                            transfer.duration = transfer.elapsed.elapsed();
                             transfer.state = if error.contains("transfer cancelled") {
                                 "Cancelled".into()
                             } else {
@@ -358,6 +487,8 @@ impl App {
             RuntimeEvent::TransferStarted { id } => {
                 if let Some(transfer) = self.transfers.iter_mut().find(|item| item.id == id) {
                     transfer.state = "Running".into();
+                    transfer.started_at = SystemTime::now();
+                    transfer.elapsed = Instant::now();
                 }
             }
             RuntimeEvent::FileOperationFinished { side, message } => {
@@ -379,6 +510,18 @@ impl App {
             }
             event => self.terminals.process_event(event),
         }
+    }
+
+    pub fn record_terminal_exit(&mut self, session_id: u64, status: &str) {
+        if let Some(item) = self
+            .history
+            .iter_mut()
+            .find(|item| item.session_id == Some(session_id))
+        {
+            item.status = format!("Exited: {status}");
+            self.save_history();
+        }
+        self.status = format!("Terminal {session_id} exited: {status}");
     }
 
     fn refresh_files(&mut self, side: FilePanel) {
@@ -683,12 +826,23 @@ impl App {
             Action::SaveDialog => self.save_host_dialog(),
             Action::ReloadHosts => self.reload_hosts(),
             Action::SelectScreen(screen) => {
+                let old_screen = self.screen;
                 self.screen = screen;
+                if old_screen != screen {
+                    self.last_file_click = None;
+                    if self.recent_screens.back().copied() != Some(screen) {
+                        self.recent_screens.push_back(screen);
+                        while self.recent_screens.len() > 2 {
+                            self.recent_screens.pop_front();
+                        }
+                    }
+                }
                 self.focus = match screen {
                     Screen::Hosts => FocusTarget::HostList,
                     Screen::Terminal => FocusTarget::Terminal,
                     Screen::Files => FocusTarget::LocalFiles,
                     Screen::Transfers => FocusTarget::HostList,
+                    Screen::History => FocusTarget::HostList,
                 };
                 if screen == Screen::Files {
                     let selected_host = self
@@ -721,6 +875,12 @@ impl App {
                     Screen::ALL[(i + Screen::ALL.len() - 1) % Screen::ALL.len()],
                 ));
             }
+            Action::RecentScreen => {
+                if self.recent_screens.len() > 1 {
+                    let previous = self.recent_screens.front().copied().unwrap_or(self.screen);
+                    self.update(Action::SelectScreen(previous));
+                }
+            }
             Action::MoveSelection(delta) if self.screen == Screen::Files => {
                 let side = self.files.active;
                 let has_parent = match side {
@@ -744,6 +904,22 @@ impl App {
                     .saturating_add_signed(delta)
                     .min(self.hosts.len() - 1);
             }
+            Action::MoveSelection(delta)
+                if self.screen == Screen::History && !self.history.is_empty() =>
+            {
+                self.selected_history = self
+                    .selected_history
+                    .saturating_add_signed(delta)
+                    .min(self.history.len() - 1);
+            }
+            Action::MoveSelection(delta)
+                if self.screen == Screen::Transfers && !self.transfers.is_empty() =>
+            {
+                self.selected_transfer = self
+                    .selected_transfer
+                    .saturating_add_signed(delta)
+                    .min(self.transfers.len() - 1);
+            }
             Action::MoveSelection(_) => {}
             Action::Focus(target) => self.focus = target,
             Action::ConnectHost => {
@@ -757,11 +933,40 @@ impl App {
                         self.terminal_size,
                         self.runtime_tx.clone(),
                     ) {
-                        Ok(_) => self.update(Action::SelectScreen(Screen::Terminal)),
-                        Err(error) => self.status = format!("Could not start SSH: {error:#}"),
+                        Ok(session_id) => {
+                            self.add_history(alias, "Started".into(), Some(session_id));
+                            self.update(Action::SelectScreen(Screen::Terminal));
+                        }
+                        Err(error) => {
+                            self.add_history(alias, format!("Failed: {error:#}"), None);
+                            self.status = format!("Could not start SSH: {error:#}");
+                        }
                     }
                 } else {
                     self.status = "Select an SSH host first".into();
+                }
+            }
+            Action::ConnectHistory => {
+                if let Some(alias) = self
+                    .history
+                    .get(self.selected_history)
+                    .map(|entry| entry.alias.clone())
+                {
+                    if let Some(index) = self.hosts.iter().position(|host| host.alias == alias) {
+                        self.selected_host = index;
+                        self.update(Action::ConnectHost);
+                    } else {
+                        self.status = format!("SSH host '{alias}' is no longer configured");
+                    }
+                }
+            }
+            Action::DeleteHistory => {
+                if self.selected_history < self.history.len() {
+                    self.history.remove(self.selected_history);
+                    self.selected_history = self
+                        .selected_history
+                        .min(self.history.len().saturating_sub(1));
+                    self.save_history();
                 }
             }
             Action::OpenLocalTerminal => match self.terminals.open_local(
@@ -789,6 +994,9 @@ impl App {
             }
             Action::Refresh => self.status = "Refresh is not available on this screen yet".into(),
             Action::FocusFilePanel(side) => {
+                if self.files.active != side {
+                    self.last_file_click = None;
+                }
                 self.files.active = side;
                 self.focus = match side {
                     FilePanel::Local => FocusTarget::LocalFiles,
@@ -878,20 +1086,28 @@ impl App {
                     return;
                 }
                 let overwrite = std::mem::take(&mut self.overwrite_confirmed);
+                let renamed = self.rename_transfer_target.take();
+                let destination_name = renamed.as_deref().unwrap_or(&entry.name);
                 let target_exists = match side {
                     FilePanel::Local => self
                         .files
                         .remote_entries
                         .iter()
-                        .any(|item| item.name == entry.name),
+                        .any(|item| item.name == destination_name),
                     FilePanel::Remote => self
                         .files
                         .local_entries
                         .iter()
-                        .any(|item| item.name == entry.name),
+                        .any(|item| item.name == destination_name),
                 };
-                if entry.kind == crate::filesystem::EntryKind::File && target_exists && !overwrite {
-                    self.file_modal = Some(FileModal::ConfirmOverwrite { side, entry });
+                if target_exists && !overwrite {
+                    self.file_modal = Some(FileModal::ConfirmOverwrite {
+                        side,
+                        rename: renamed.unwrap_or_else(|| format!("{} (copy)", entry.name)),
+                        entry,
+                        choice: 0,
+                        rename_touched: false,
+                    });
                     return;
                 }
                 let Some(host) = self
@@ -908,9 +1124,17 @@ impl App {
                 let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
                 let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let semaphore = self.transfer_semaphore.clone();
-                let destination = match side {
-                    FilePanel::Local => self.files.remote_path.join(&entry.name),
-                    FilePanel::Remote => self.files.local_path.join(&entry.name),
+                let target_dir = match side {
+                    FilePanel::Local => &self.files.remote_path,
+                    FilePanel::Remote => &self.files.local_path,
+                };
+                let destination = match crate::filesystem::safe_child(target_dir, destination_name)
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.status = format!("Invalid destination name: {error}");
+                        return;
+                    }
                 };
                 let source = entry.path.clone();
                 let label = format!(
@@ -935,9 +1159,24 @@ impl App {
                     total_bytes: (entry.kind == crate::filesystem::EntryKind::File)
                         .then_some(entry.size)
                         .flatten(),
+                    source: if side == FilePanel::Local {
+                        format!("localhost:{}", source.display())
+                    } else {
+                        format!("{host}:{}", source.display())
+                    },
+                    destination: if side == FilePanel::Local {
+                        format!("{host}:{}", destination.display())
+                    } else {
+                        format!("localhost:{}", destination.display())
+                    },
+                    file_path: source.clone(),
+                    started_at: SystemTime::now(),
+                    elapsed: Instant::now(),
+                    duration: Duration::ZERO,
                     cancel,
                 });
-                self.screen = Screen::Transfers;
+                self.selected_transfer = self.transfers.len().saturating_sub(1);
+                self.update(Action::SelectScreen(Screen::Transfers));
                 let tx = self.runtime_tx.clone();
                 tokio::spawn(async move {
                     let Ok(_permit) = semaphore.acquire_owned().await else {
@@ -992,9 +1231,14 @@ impl App {
             Action::CancelTransfer => {
                 if let Some(transfer) = self
                     .transfers
-                    .iter()
-                    .rev()
-                    .find(|item| item.state == "Running")
+                    .get(self.selected_transfer)
+                    .filter(|item| item.state == "Running")
+                    .or_else(|| {
+                        self.transfers
+                            .iter()
+                            .rev()
+                            .find(|item| item.state == "Running")
+                    })
                 {
                     let _ = transfer.cancel.send(true);
                     self.status = format!(
@@ -1006,7 +1250,14 @@ impl App {
                 }
             }
             Action::ConfirmFileOverwrite => {
-                if let Some(FileModal::ConfirmOverwrite { side, entry }) = self.file_modal.take() {
+                if let Some(FileModal::ConfirmOverwrite {
+                    side,
+                    entry,
+                    rename,
+                    choice,
+                    ..
+                }) = self.file_modal.take()
+                {
                     self.files.active = side;
                     let has_parent = match side {
                         FilePanel::Local => self.files.local_path.parent().is_some(),
@@ -1026,8 +1277,111 @@ impl App {
                                 self.files.selected_remote = index + usize::from(has_parent)
                             }
                         }
-                        self.overwrite_confirmed = true;
-                        self.update(Action::TransferSelected);
+                        match choice {
+                            0 => {
+                                self.rename_transfer_target = Some(rename);
+                                self.update(Action::TransferSelected);
+                            }
+                            1 => {
+                                self.overwrite_confirmed = true;
+                                self.update(Action::TransferSelected);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Action::OpenFileContextMenu => {
+                self.file_modal = Some(FileModal::ContextMenu {
+                    side: self.files.active,
+                    choice: 0,
+                });
+            }
+            Action::ContextAction(index) => {
+                let side = match self.file_modal.take() {
+                    Some(FileModal::ContextMenu { side, .. }) => side,
+                    _ => return,
+                };
+                self.files.active = side;
+                match index {
+                    0 => self.update(Action::OpenFileViewer),
+                    1 => self.update(Action::OpenFileEntry),
+                    2 => self.update(Action::TransferSelected),
+                    3 => self.update(Action::RenameSelected),
+                    4 => self.update(Action::NewDirectory),
+                    5 => self.update(Action::DeleteSelected),
+                    6 => self.update(Action::Refresh),
+                    _ => {}
+                }
+            }
+            Action::ChooseFileOption(delta) => match self.file_modal.as_mut() {
+                Some(FileModal::ConfirmOverwrite { choice, .. }) => {
+                    *choice = (*choice as isize + delta).rem_euclid(4) as usize
+                }
+                Some(FileModal::ContextMenu { choice, .. }) => {
+                    *choice = (*choice as isize + delta).rem_euclid(7) as usize
+                }
+                _ => {}
+            },
+            Action::ScrollViewer(delta) => {
+                if let Some(FileModal::Viewer { offset, .. }) = self.file_modal.as_mut() {
+                    *offset = offset.saturating_add_signed(delta).min(usize::MAX / 2);
+                }
+            }
+            Action::OpenFileViewer => {
+                let side = self.files.active;
+                if let Some(entry) = self.selected_file(side) {
+                    match entry.kind {
+                        crate::filesystem::EntryKind::Directory => {
+                            self.update(Action::OpenFileEntry)
+                        }
+                        crate::filesystem::EntryKind::File => {
+                            if side == FilePanel::Local {
+                                let result = std::fs::metadata(&entry.path).and_then(|metadata| {
+                                    if metadata.len() > 2 * 1024 * 1024 {
+                                        return Err(std::io::Error::other("viewer limit is 2 MiB"));
+                                    }
+                                    std::fs::read_to_string(&entry.path)
+                                });
+                                match result {
+                                    Ok(content) => {
+                                        self.file_modal = Some(FileModal::Viewer {
+                                            title: entry.path.display().to_string(),
+                                            content,
+                                            offset: 0,
+                                        })
+                                    }
+                                    Err(error) => {
+                                        self.status = format!("Could not read file: {error}")
+                                    }
+                                }
+                            } else {
+                                self.status = "Remote viewer is loading".into();
+                                let host = self.files.remote_host.clone();
+                                let path = entry.path.clone();
+                                let title = entry.path.display().to_string();
+                                let tx = self.runtime_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = async {
+                                        let host = host.context("select an SSH host first")?;
+                                        let mut remote =
+                                            crate::sftp::RemoteFs::connect(&host).await?;
+                                        let data = remote.read_file(&path).await;
+                                        let _ = remote.close().await;
+                                        data
+                                    }
+                                    .await
+                                    .map_err(|error: anyhow::Error| format!("{error:#}"));
+                                    let _ = tx
+                                        .send(RuntimeEvent::FilePreviewLoaded {
+                                            title,
+                                            content: result,
+                                        })
+                                        .await;
+                                });
+                            }
+                        }
+                        _ => self.status = "This entry cannot be viewed".into(),
                     }
                 }
             }
@@ -1113,6 +1467,18 @@ impl App {
                     match self.file_modal.as_mut() {
                         Some(FileModal::Input { value, .. })
                         | Some(FileModal::PathInput { value, .. }) => value.push(ch),
+                        Some(FileModal::ConfirmOverwrite {
+                            rename,
+                            rename_touched,
+                            choice: 0,
+                            ..
+                        }) => {
+                            if !*rename_touched {
+                                rename.clear();
+                                *rename_touched = true;
+                            }
+                            rename.push(ch);
+                        }
                         _ => {}
                     }
                 }
@@ -1120,6 +1486,19 @@ impl App {
             Action::BackspaceFileInput => match self.file_modal.as_mut() {
                 Some(FileModal::Input { value, .. }) | Some(FileModal::PathInput { value, .. }) => {
                     value.pop();
+                }
+                Some(FileModal::ConfirmOverwrite {
+                    rename,
+                    rename_touched,
+                    choice: 0,
+                    ..
+                }) => {
+                    if !*rename_touched {
+                        rename.clear();
+                        *rename_touched = true;
+                    } else {
+                        rename.pop();
+                    }
                 }
                 _ => {}
             },
@@ -1172,10 +1551,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ssh_home = dir.path().join(".ssh");
         let store = HostStore::new(&ssh_home, ssh_home.join("fpsxterm-tui"));
-        let mut app = App::new(AppConfig::default(), tx, store, Vec::new());
+        let mut app = App::new(
+            AppConfig::default(),
+            tx,
+            store,
+            Vec::new(),
+            dir.path().join("history.toml"),
+        );
         app.update(Action::PreviousScreen);
-        assert_eq!(app.screen, Screen::Transfers);
+        assert_eq!(app.screen, Screen::History);
         app.update(Action::NextScreen);
         assert_eq!(app.screen, Screen::Hosts);
     }
+}
+
+fn read_history(path: &std::path::Path) -> Vec<HistoryEntry> {
+    let mut history = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<HistoryFile>(&text).ok())
+        .map(|file| file.entries)
+        .unwrap_or_default();
+    for item in &mut history {
+        if item.status == "Started" {
+            item.status = "Interrupted (previous run)".into();
+        }
+    }
+    history
 }

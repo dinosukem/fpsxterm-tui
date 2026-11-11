@@ -67,7 +67,13 @@ async fn main() -> Result<()> {
     let (runtime_tx, runtime_rx) = mpsc::channel(64);
     run(
         &mut terminal,
-        App::new(config, runtime_tx, host_store, hosts),
+        App::new(
+            config,
+            runtime_tx,
+            host_store,
+            hosts,
+            config_store.history_path(),
+        ),
         runtime_rx,
     )
     .await
@@ -86,8 +92,8 @@ async fn run(
                 let size = terminal.size()?;
                 let pty_area = ui::terminal_content_rect(ratatui::layout::Rect::new(0, 0, size.width, size.height));
                 if app.screen == Screen::Terminal { app.resize_terminal(pty_area.height, pty_area.width); }
-                for (id, status) in app.terminals.poll_exits() { app.status = format!("Terminal {id} exited: {status}"); }
-                terminal.draw(|frame| { app.set_terminal_rect(ui::terminal_content_rect(frame.area())); ui::render(frame, &app) })?;
+                for (id, status) in app.terminals.poll_exits() { app.record_terminal_exit(id, &status); }
+                terminal.draw(|frame| { app.set_viewport(frame.area()); app.set_terminal_rect(ui::terminal_content_rect(frame.area())); ui::render(frame, &app) })?;
             }
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(event)) => handle_event(&mut app, event),
@@ -108,16 +114,46 @@ fn handle_event(app: &mut App, event: Event) {
                 let is_overwrite =
                     matches!(modal, fpsxterm_tui::app::FileModal::ConfirmOverwrite { .. });
                 let is_path = matches!(modal, fpsxterm_tui::app::FileModal::PathInput { .. });
+                let is_viewer = matches!(modal, fpsxterm_tui::app::FileModal::Viewer { .. });
+                let context_choice = match modal {
+                    fpsxterm_tui::app::FileModal::ContextMenu { choice, .. } => Some(*choice),
+                    _ => None,
+                };
+                let overwrite_choice = match modal {
+                    fpsxterm_tui::app::FileModal::ConfirmOverwrite { choice, .. } => Some(*choice),
+                    _ => None,
+                };
                 let is_confirm = is_delete || is_overwrite;
                 match key.code {
                     KeyCode::Esc => app.update(Action::CancelFileDialog),
+                    KeyCode::Up if is_viewer => app.update(Action::ScrollViewer(-1)),
+                    KeyCode::Down if is_viewer => app.update(Action::ScrollViewer(1)),
+                    KeyCode::PageUp if is_viewer => app.update(Action::ScrollViewer(-20)),
+                    KeyCode::PageDown if is_viewer => app.update(Action::ScrollViewer(20)),
+                    KeyCode::Up | KeyCode::Left if is_overwrite || context_choice.is_some() => {
+                        app.update(Action::ChooseFileOption(-1))
+                    }
+                    KeyCode::Down | KeyCode::Right if is_overwrite || context_choice.is_some() => {
+                        app.update(Action::ChooseFileOption(1))
+                    }
+                    KeyCode::Up if context_choice.is_some() => {
+                        app.update(Action::ChooseFileOption(-1))
+                    }
+                    KeyCode::Down if context_choice.is_some() => {
+                        app.update(Action::ChooseFileOption(1))
+                    }
+                    KeyCode::Enter if let Some(choice) = context_choice => {
+                        app.update(Action::ContextAction(choice))
+                    }
                     KeyCode::Backspace => app.update(Action::BackspaceFileInput),
                     KeyCode::Enter if is_delete => app.update(Action::ConfirmFileDelete),
                     KeyCode::Enter if is_overwrite => app.update(Action::ConfirmFileOverwrite),
                     KeyCode::Enter if is_path => app.update(Action::ApplyCurrentPath),
                     KeyCode::Enter => app.update(Action::SaveFileInput),
                     KeyCode::Char(ch)
-                        if !is_confirm
+                        if (!is_confirm || overwrite_choice == Some(0))
+                            && !is_viewer
+                            && context_choice.is_none()
                             && !key
                                 .modifiers
                                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -158,6 +194,48 @@ fn handle_event(app: &mut App, event: Event) {
                 }
                 return;
             }
+            if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.update(Action::RecentScreen);
+                return;
+            }
+            if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.update(Action::Quit);
+                return;
+            }
+            if key.code == KeyCode::BackTab && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.update(Action::PreviousScreen);
+                return;
+            }
+            if key.code == KeyCode::BackTab
+                || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+            {
+                app.update(Action::NextScreen);
+                return;
+            }
+            if key.code == KeyCode::F(8) {
+                app.update(Action::RecentScreen);
+                return;
+            }
+            if key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::ALT) {
+                app.update(Action::PreviousScreen);
+                return;
+            }
+            if key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::ALT) {
+                app.update(Action::NextScreen);
+                return;
+            }
+            if let KeyCode::Char(ch @ '1'..='9') = key.code
+                && (key.modifiers.contains(KeyModifiers::ALT)
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && app.screen == Screen::Terminal))
+                && app.screen == Screen::Terminal
+            {
+                app.select_terminal_index(usize::from(ch as u8 - b'1'));
+                app.update(Action::Focus(
+                    fpsxterm_tui::input::focus::FocusTarget::Terminal,
+                ));
+                return;
+            }
             if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.update(Action::Focus(
                     fpsxterm_tui::input::focus::FocusTarget::HostList,
@@ -174,12 +252,16 @@ fn handle_event(app: &mut App, event: Event) {
                 return;
             }
             if app.screen == Screen::Files {
+                if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.update(Action::OpenFileContextMenu);
+                    return;
+                }
                 if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     app.update(Action::EditCurrentPath);
                     return;
                 }
                 match key.code {
-                    KeyCode::Tab => {
+                    KeyCode::Tab if key.modifiers.is_empty() => {
                         let side = if app.files.active == fpsxterm_tui::app::FilePanel::Local {
                             fpsxterm_tui::app::FilePanel::Remote
                         } else {
@@ -187,7 +269,7 @@ fn handle_event(app: &mut App, event: Event) {
                         };
                         app.update(Action::FocusFilePanel(side));
                     }
-                    KeyCode::Enter => app.update(Action::OpenFileEntry),
+                    KeyCode::Enter => app.update(Action::OpenFileViewer),
                     KeyCode::Backspace => app.update(Action::ParentDirectory),
                     KeyCode::F(5) | KeyCode::Char('r') => app.update(Action::Refresh),
                     KeyCode::F(6) => app.update(Action::TransferSelected),
@@ -198,19 +280,20 @@ fn handle_event(app: &mut App, event: Event) {
                     KeyCode::Esc => app.update(Action::SelectScreen(Screen::Hosts)),
                     _ => {}
                 }
-                if matches!(
-                    key.code,
-                    KeyCode::Tab
-                        | KeyCode::Enter
-                        | KeyCode::Backspace
-                        | KeyCode::F(5)
-                        | KeyCode::F(6)
-                        | KeyCode::F(2)
-                        | KeyCode::F(7)
-                        | KeyCode::Delete
-                        | KeyCode::Char('r')
-                        | KeyCode::Esc
-                ) {
+                if (key.code == KeyCode::Tab && key.modifiers.is_empty())
+                    || matches!(
+                        key.code,
+                        KeyCode::Enter
+                            | KeyCode::Backspace
+                            | KeyCode::F(5)
+                            | KeyCode::F(6)
+                            | KeyCode::F(2)
+                            | KeyCode::F(7)
+                            | KeyCode::Delete
+                            | KeyCode::Char('r')
+                            | KeyCode::Esc
+                    )
+                {
                     return;
                 }
             }
@@ -222,15 +305,12 @@ fn handle_event(app: &mut App, event: Event) {
                 KeyCode::Char('q') => app.update(Action::Quit),
                 KeyCode::Tab => app.update(Action::NextScreen),
                 KeyCode::BackTab => app.update(Action::PreviousScreen),
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
-                    app.update(Action::PreviousScreen)
-                }
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                    app.update(Action::NextScreen)
-                }
                 KeyCode::Up => app.update(Action::MoveSelection(-1)),
                 KeyCode::Down => app.update(Action::MoveSelection(1)),
                 KeyCode::Enter if app.screen == Screen::Hosts => app.update(Action::ConnectHost),
+                KeyCode::Enter if app.screen == Screen::History => {
+                    app.update(Action::ConnectHistory)
+                }
                 KeyCode::Char('n') if app.screen == Screen::Terminal => {
                     app.update(Action::OpenLocalTerminal)
                 }
@@ -240,21 +320,16 @@ fn handle_event(app: &mut App, event: Event) {
                 KeyCode::Char('x') if app.screen == Screen::Terminal => {
                     app.update(Action::CloseTerminal)
                 }
-                KeyCode::Char(ch @ '1'..='9')
-                    if key.modifiers.contains(KeyModifiers::ALT)
-                        && app.screen == Screen::Terminal =>
-                {
-                    app.select_terminal_index(usize::from(ch as u8 - b'1'));
-                    app.update(Action::Focus(
-                        fpsxterm_tui::input::focus::FocusTarget::Terminal,
-                    ));
+                KeyCode::Delete if app.screen == Screen::History => {
+                    app.update(Action::DeleteHistory)
                 }
-                KeyCode::Char('1' | '2' | '3' | '4') => {
+                KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
                     let index = match key.code {
                         KeyCode::Char('1') => 0,
                         KeyCode::Char('2') => 1,
                         KeyCode::Char('3') => 2,
-                        _ => 3,
+                        KeyCode::Char('4') => 3,
+                        _ => 4,
                     };
                     app.update(Action::SelectScreen(Screen::ALL[index]));
                 }
@@ -272,46 +347,34 @@ fn handle_event(app: &mut App, event: Event) {
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if mouse.row <= 3 => {
-                let index =
-                    usize::from(mouse.column.saturating_sub(2) / 12).min(Screen::ALL.len() - 1);
-                app.update(Action::SelectScreen(Screen::ALL[index]));
+            MouseEventKind::Down(MouseButton::Left) if (1..=3).contains(&mouse.row) => {
+                if let Some(screen) = ui::workspace_tab_at(mouse.column) {
+                    app.update(Action::SelectScreen(screen));
+                }
             }
             MouseEventKind::Down(MouseButton::Left)
-                if app.screen == Screen::Hosts && mouse.row >= 5 =>
+                if app.screen == Screen::Hosts
+                    && mouse.row >= 5
+                    && mouse.column < app.viewport.width * 58 / 100 =>
             {
-                let index = usize::from(mouse.row.saturating_sub(5));
+                let visible = usize::from(app.viewport.height.saturating_sub(9)).max(1);
+                let offset = app.selected_host.saturating_add(1).saturating_sub(visible);
+                let index = usize::from(mouse.row.saturating_sub(5)).saturating_add(offset);
                 if index < app.hosts.len() {
                     app.selected_host = index;
                 }
             }
-            MouseEventKind::Down(MouseButton::Left)
-                if app.screen == Screen::Files && mouse.row >= 5 =>
-            {
-                let side = if mouse.column < app.terminal_size.cols / 2 {
-                    fpsxterm_tui::app::FilePanel::Local
-                } else {
-                    fpsxterm_tui::app::FilePanel::Remote
-                };
-                app.update(Action::FocusFilePanel(side));
-                let has_parent = match side {
-                    fpsxterm_tui::app::FilePanel::Local => app.files.local_path.parent().is_some(),
-                    fpsxterm_tui::app::FilePanel::Remote => {
-                        app.files.remote_path.parent().is_some()
-                    }
-                };
-                let index = usize::from(mouse.row.saturating_sub(5));
-                let selected = index.saturating_sub(usize::from(has_parent));
-                match side {
-                    fpsxterm_tui::app::FilePanel::Local => {
-                        app.files.selected_local =
-                            selected.min(app.files.local_entries.len().saturating_sub(1))
-                    }
-                    fpsxterm_tui::app::FilePanel::Remote => {
-                        app.files.selected_remote =
-                            selected.min(app.files.remote_entries.len().saturating_sub(1))
-                    }
-                }
+            MouseEventKind::Down(MouseButton::Left) if app.screen == Screen::Files => {
+                select_file_at(app, mouse.column, mouse.row, false)
+            }
+            MouseEventKind::Down(MouseButton::Right) if app.screen == Screen::Files => {
+                select_file_at(app, mouse.column, mouse.row, true)
+            }
+            MouseEventKind::Down(MouseButton::Left) if app.screen == Screen::History => {
+                select_history_at(app, mouse.column, mouse.row)
+            }
+            MouseEventKind::Down(MouseButton::Left) if app.screen == Screen::Transfers => {
+                select_transfer_at(app, mouse.column, mouse.row)
             }
             kind if app.screen == Screen::Terminal
                 && app
@@ -350,6 +413,102 @@ fn handle_event(app: &mut App, event: Event) {
         },
         Event::Resize(_, _) => {}
         _ => {}
+    }
+}
+
+fn select_file_at(app: &mut App, column: u16, row: u16, context_menu: bool) {
+    if row < 5 || row >= app.viewport.height.saturating_sub(4) {
+        return;
+    }
+    let side = if column < app.viewport.width / 2 {
+        fpsxterm_tui::app::FilePanel::Local
+    } else {
+        fpsxterm_tui::app::FilePanel::Remote
+    };
+    app.update(Action::FocusFilePanel(side));
+    let loading = match side {
+        fpsxterm_tui::app::FilePanel::Local => app.files.loading_local,
+        fpsxterm_tui::app::FilePanel::Remote => app.files.loading_remote,
+    };
+    let selected = app
+        .files
+        .selected(side)
+        .saturating_add(usize::from(loading));
+    let visible = usize::from(app.viewport.height.saturating_sub(9)).max(1);
+    let offset = selected.saturating_add(1).saturating_sub(visible);
+    let relative = usize::from(row - 5)
+        .saturating_add(offset)
+        .saturating_sub(usize::from(loading));
+    let has_parent = match side {
+        fpsxterm_tui::app::FilePanel::Local => app.files.local_path.parent().is_some(),
+        fpsxterm_tui::app::FilePanel::Remote => app.files.remote_path.parent().is_some(),
+    };
+    let count = app.files.entries(side).len() + usize::from(has_parent);
+    if relative >= count {
+        return;
+    }
+    match side {
+        fpsxterm_tui::app::FilePanel::Local => app.files.selected_local = relative,
+        fpsxterm_tui::app::FilePanel::Remote => app.files.selected_remote = relative,
+    }
+    if context_menu {
+        app.last_file_click = None;
+        app.update(Action::OpenFileContextMenu);
+        return;
+    }
+    let double_click = app
+        .last_file_click
+        .is_some_and(|(at, old_column, old_row)| {
+            old_column == column && old_row == row && at.elapsed().as_millis() <= 450
+        });
+    app.last_file_click = Some((std::time::Instant::now(), column, row));
+    if double_click {
+        app.update(Action::OpenFileViewer);
+    }
+}
+
+fn select_history_at(app: &mut App, column: u16, row: u16) {
+    if column >= app.viewport.width * 68 / 100
+        || row < 5
+        || row >= app.viewport.height.saturating_sub(4)
+    {
+        return;
+    }
+    let visible = usize::from(app.viewport.height.saturating_sub(9)).max(1);
+    let offset = app
+        .selected_history
+        .saturating_add(1)
+        .saturating_sub(visible);
+    let index = usize::from(row - 5).saturating_add(offset);
+    if index >= app.history.len() {
+        return;
+    }
+    let double_click = app
+        .last_file_click
+        .is_some_and(|(at, old_column, old_row)| {
+            old_column == column && old_row == row && at.elapsed().as_millis() <= 450
+        });
+    app.selected_history = index;
+    app.last_file_click = Some((std::time::Instant::now(), column, row));
+    if double_click {
+        app.update(Action::ConnectHistory);
+    }
+}
+
+fn select_transfer_at(app: &mut App, _column: u16, row: u16) {
+    let body_height = app.viewport.height.saturating_sub(7);
+    let table_height = u32::from(body_height) * 65 / 100;
+    let visible = (table_height as usize).saturating_sub(3).max(1);
+    if row < 6 || u32::from(row) >= 4 + table_height.saturating_sub(1) {
+        return;
+    }
+    let offset = app
+        .selected_transfer
+        .saturating_add(1)
+        .saturating_sub(visible);
+    let index = usize::from(row - 6).saturating_add(offset);
+    if index < app.transfers.len() {
+        app.selected_transfer = index;
     }
 }
 
