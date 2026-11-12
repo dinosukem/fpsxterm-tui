@@ -1,0 +1,12 @@
+format_code_in_doc_comments = true
+imports_layout = "Vertical"
+force_multiline_blocks = true
+wrap_comments = true
+reorder_imports = true
+imports_granularity = "One"
+group_imports = "One"
+edition = "2021"
+# This option will merge imports, however it's only available in +nightly.
+# imports_granularity = "Module"
+# fn_args_density = "Compressed"
+# overflow_delimited_expr = "true"
