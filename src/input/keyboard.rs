@@ -1,7 +1,27 @@
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{
+    KeyCode,
+    KeyModifiers,
+};
 
 pub(super) fn key_to_bytes(key: crossterm::event::KeyEvent, application_cursor: bool) -> Vec<u8> {
-    use KeyCode::*;
+    use KeyCode::{
+        Backspace,
+        Char,
+        Delete,
+        Down,
+        End,
+        Enter,
+        Esc,
+        F,
+        Home,
+        Insert,
+        Left,
+        PageDown,
+        PageUp,
+        Right,
+        Tab,
+        Up,
+    };
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if let Char(c @ 'a'..='z') = key.code {
             return vec![c as u8 - b'a' + 1];

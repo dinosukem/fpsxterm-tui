@@ -4,8 +4,8 @@ pub(super) fn render(frame: &mut Frame<'_>, choice: usize, area: Rect) {
     let rect = super::centered(48, 12, area);
     frame.render_widget(Clear, rect);
     let items = [
-        "View / open",
-        "Edit with configured terminal editor",
+        "View",
+        "Open in editor (Ctrl+Enter)",
         "Transfer",
         "Rename",
         "New folder",

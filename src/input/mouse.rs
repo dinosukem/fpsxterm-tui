@@ -1,4 +1,8 @@
-use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    KeyModifiers,
+    MouseButton,
+    MouseEventKind,
+};
 
 pub(super) fn encode_mouse(
     kind: MouseEventKind,

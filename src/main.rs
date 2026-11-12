@@ -1,22 +1,38 @@
-use std::time::Duration;
-
-use anyhow::{Context, Result};
-use crossterm::{
-    event::EventStream,
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use futures_util::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend};
-use tokio::sync::mpsc;
-use tokio::time::interval;
-
-use fpsxterm_tui::{
-    app::{App, Screen},
-    config::ConfigStore,
-    event::Action,
-    ssh::HostStore,
-    ui,
+use {
+    anyhow::{
+        Context,
+        Result,
+    },
+    crossterm::{
+        event::EventStream,
+        execute,
+        terminal::{
+            EnterAlternateScreen,
+            LeaveAlternateScreen,
+            disable_raw_mode,
+            enable_raw_mode,
+        },
+    },
+    fpsxterm_tui::{
+        app::{
+            App,
+            Screen,
+        },
+        config::ConfigStore,
+        event::Action,
+        ssh::HostStore,
+        ui,
+    },
+    futures_util::StreamExt,
+    ratatui::{
+        Terminal,
+        backend::CrosstermBackend,
+    },
+    std::time::Duration,
+    tokio::{
+        sync::mpsc,
+        time::interval,
+    },
 };
 
 struct TerminalGuard;
@@ -56,11 +72,15 @@ async fn main() -> Result<()> {
     });
     enable_raw_mode().context("enabling terminal raw mode")?;
     let _guard = TerminalGuard;
-    execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )
+    if config.ui.mouse_enabled {
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )
+    } else {
+        execute!(std::io::stdout(), EnterAlternateScreen)
+    }
     .context("initializing terminal screen")?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -73,6 +93,7 @@ async fn main() -> Result<()> {
             host_store,
             hosts,
             config_store.history_path(),
+            config_store,
         ),
         runtime_rx,
     )

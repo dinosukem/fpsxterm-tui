@@ -1,5 +1,7 @@
 mod action;
 mod message;
 
-pub use action::Action;
-pub use message::RuntimeEvent;
+pub use {
+    action::Action,
+    message::RuntimeEvent,
+};

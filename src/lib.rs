@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod docker_fs;
 pub mod error;
 pub mod event;
 pub mod filesystem;

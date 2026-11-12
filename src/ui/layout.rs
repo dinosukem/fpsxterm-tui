@@ -1,17 +1,37 @@
-use ratatui::layout::Rect;
-
-use crate::app::Screen;
+use {
+    crate::app::Screen,
+    ratatui::{
+        layout::{
+            Constraint,
+            Direction,
+            Layout,
+            Rect,
+        },
+        widgets::{
+            Block,
+            Borders,
+        },
+    },
+};
 
 pub fn terminal_content_rect(area: Rect) -> Rect {
     if area.height < 10 || area.width < 3 {
         return Rect::default();
     }
-    Rect::new(
-        1,
-        6,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(9),
-    )
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let terminal = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(root[2]);
+    Block::default().borders(Borders::ALL).inner(terminal[1])
 }
 
 pub fn workspace_tab_at(column: u16) -> Option<Screen> {
@@ -39,9 +59,14 @@ pub fn file_context_menu_item_at(column: u16, row: u16, area: Rect) -> Option<us
 
 #[cfg(test)]
 mod tests {
-    use super::{file_context_menu_item_at, workspace_tab_at};
-    use crate::app::Screen;
-    use ratatui::layout::Rect;
+    use {
+        super::{
+            file_context_menu_item_at,
+            workspace_tab_at,
+        },
+        crate::app::Screen,
+        ratatui::layout::Rect,
+    };
 
     #[test]
     fn workspace_tabs_match_rendered_padding_and_dividers() {
@@ -50,7 +75,8 @@ mod tests {
         assert_eq!(workspace_tab_at(24), Some(Screen::Files));
         assert_eq!(workspace_tab_at(34), Some(Screen::Transfers));
         assert_eq!(workspace_tab_at(48), Some(Screen::History));
-        assert_eq!(workspace_tab_at(59), None);
+        assert_eq!(workspace_tab_at(60), Some(Screen::Configuration));
+        assert_eq!(workspace_tab_at(77), None);
     }
 
     #[test]

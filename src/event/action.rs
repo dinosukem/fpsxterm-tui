@@ -1,4 +1,7 @@
-use crate::{app::Screen, input::focus::FocusTarget};
+use crate::{
+    app::Screen,
+    input::focus::FocusTarget,
+};
 
 #[derive(Debug)]
 pub enum Action {
@@ -11,6 +14,12 @@ pub enum Action {
     Focus(FocusTarget),
     ConnectHost,
     ConnectHistory,
+    TestConnection,
+    TestDialogConnection,
+    NewDockerHost,
+    ListDockerContainers,
+    MoveDockerChoice(isize),
+    ScrollHostDelete(isize),
     NewHost,
     EditHost,
     ImportHost,
@@ -24,6 +33,7 @@ pub enum Action {
     ReloadHosts,
     OpenLocalTerminal,
     CloseTerminal,
+    ConfirmSessionClose,
     SendTerminalInput(Vec<u8>),
     SelectTerminal(u64),
     Refresh,
@@ -49,5 +59,6 @@ pub enum Action {
     InsertFileChar(char),
     BackspaceFileInput,
     EditCurrentPath,
+    CompletePath,
     ApplyCurrentPath,
 }
