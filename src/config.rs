@@ -119,9 +119,20 @@ impl ConfigStore {
     }
 
     pub fn load(&self) -> Result<AppConfig> {
+        if fs::symlink_metadata(&self.config_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            anyhow::bail!("refusing to read config through a symbolic link");
+        }
         match fs::read_to_string(&self.config_path) {
             Ok(contents) => toml::from_str(&contents).context("parsing config.toml"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let config = AppConfig::default();
+                self.save(&config).with_context(|| {
+                    format!("creating default config at {}", self.config_path.display())
+                })?;
+                Ok(config)
+            }
             Err(error) => {
                 Err(error).with_context(|| format!("reading {}", self.config_path.display()))
             }
@@ -134,9 +145,19 @@ impl ConfigStore {
             .parent()
             .context("config directory has no parent")?;
         fs::create_dir_all(parent)?;
+        if fs::symlink_metadata(&self.config_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            anyhow::bail!("refusing to replace config through a symbolic link");
+        }
         let contents = toml::to_string_pretty(config)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         fs::write(temp.path(), contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o600))?;
+        }
         temp.persist(&self.config_path)
             .context("atomically replacing config.toml")?;
         Ok(())
@@ -156,11 +177,59 @@ mod tests {
             state_dir: dir.path().join("state"),
         };
         let config = store.load().unwrap();
+        assert!(store.config_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(store.config_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert_eq!(config.terminal.editor, ["nano"]);
         assert_eq!(config.transfer.max_concurrent, 2);
         store.save(&config).unwrap();
         let loaded = store.load().unwrap();
         assert!(loaded.files.confirm_delete);
         assert_eq!(loaded.terminal.scrollback_lines, 10_000);
+        assert!(!loaded.ui.show_hidden_files);
+    }
+
+    #[test]
+    fn show_hidden_files_can_be_enabled_or_disabled_in_config() {
+        let enabled: AppConfig = toml::from_str("[ui]\nshow_hidden_files = true").unwrap();
+        let disabled: AppConfig = toml::from_str("[ui]\nshow_hidden_files = false").unwrap();
+
+        assert!(enabled.ui.show_hidden_files);
+        assert!(!disabled.ui.show_hidden_files);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_config_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        fs::write(&target, "[ui]\nshow_hidden_files = true\n").unwrap();
+        let config_path = dir.path().join("config.toml");
+        symlink(&target, &config_path).unwrap();
+        let store = ConfigStore {
+            config_path,
+            ssh_dir: dir.path().join(".ssh/fpsxterm-tui"),
+            state_dir: dir.path().join("state"),
+        };
+
+        assert!(store.load().is_err());
+        assert!(store.save(&AppConfig::default()).is_err());
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains("show_hidden_files = true")
+        );
     }
 }

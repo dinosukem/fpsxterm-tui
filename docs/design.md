@@ -1217,10 +1217,10 @@ Các thao tác đọc PTY có tính blocking nên cần được chạy bằng t
 Cấu trúc dữ liệu:
 
 ```text
-~/.config/rust-ssh-manager/
+~/.config/fpsxterm/fpsxterm-tui/
 └── config.toml
 
-~/.local/state/rust-ssh-manager/
+~/.local/state/fpsxterm/fpsxterm-tui/
 └── app.log
 
 ~/.ssh/
@@ -1241,6 +1241,7 @@ show_hidden_files = false
 
 [terminal]
 shell = "/bin/bash"
+editor = ["nano"]
 scrollback_lines = 10000
 
 [files]
@@ -1252,6 +1253,7 @@ max_concurrent = 2
 ```
 
 Đây là cấu hình nội bộ của ứng dụng, không thay thế `~/.ssh/config`.
+Nếu chưa có file, ứng dụng tự tạo `config.toml` với các giá trị mặc định ở thư mục cấu hình XDG. File được ghi với quyền chỉ chủ sở hữu đọc/ghi trên Unix; ứng dụng từ chối đọc hoặc thay thế file cấu hình qua symbolic link.
 
 ---
 
