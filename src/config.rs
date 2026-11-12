@@ -1,8 +1,22 @@
-use std::{fs, path::PathBuf};
-
-use anyhow::{Context, Result};
-use directories::{BaseDirs, ProjectDirs};
-use serde::{Deserialize, Serialize};
+use {
+    anyhow::{
+        Context,
+        Result,
+    },
+    directories::{
+        BaseDirs,
+        ProjectDirs,
+    },
+    serde::{
+        Deserialize,
+        Serialize,
+    },
+    std::{
+        collections::BTreeMap,
+        fs,
+        path::PathBuf,
+    },
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,6 +25,32 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub files: FilesConfig,
     pub transfer: TransferConfig,
+    pub docker_hosts: Vec<DockerHostConfig>,
+    pub host_metadata: BTreeMap<String, HostMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HostMetadata {
+    pub created_at: Option<u64>,
+    pub updated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerHostConfig {
+    pub ssh_host: String,
+    pub container: String,
+    #[serde(default)]
+    pub shell: DockerShell,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerShell {
+    #[default]
+    Auto,
+    Bash,
+    Sh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +128,14 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    pub fn from_paths(config_path: PathBuf, ssh_dir: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            config_path,
+            ssh_dir,
+            state_dir,
+        }
+    }
+
     pub fn discover() -> Result<Self> {
         let dirs = ProjectDirs::from("com", "fpsxterm", "fpsxterm-tui")
             .context("could not determine XDG application directories")?;
@@ -206,6 +254,27 @@ mod tests {
 
         assert!(enabled.ui.show_hidden_files);
         assert!(!disabled.ui.show_hidden_files);
+    }
+
+    #[test]
+    fn host_metadata_is_backward_compatible_and_round_trips() {
+        let legacy: AppConfig = toml::from_str(
+            "[ui]\nshow_hidden_files = true\n\n[[docker_hosts]]\nssh_host = \"prod\"\ncontainer = \"web\"",
+        )
+        .unwrap();
+        assert!(legacy.host_metadata.is_empty());
+
+        let mut config = AppConfig::default();
+        config.host_metadata.insert(
+            "ssh:prod".into(),
+            HostMetadata {
+                created_at: Some(1_800_000_000),
+                updated_at: Some(1_800_000_100),
+            },
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.host_metadata, config.host_metadata);
     }
 
     #[cfg(unix)]

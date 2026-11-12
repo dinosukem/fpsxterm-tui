@@ -1,23 +1,36 @@
-use std::{
-    future::Future,
-    path::Path,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+use {
+    super::temporary_path,
+    crate::{
+        sftp::RemoteFs,
+        terminal::RuntimeEvent,
     },
-    time::Duration,
+    anyhow::{
+        Context,
+        Result,
+        bail,
+    },
+    std::{
+        future::Future,
+        path::Path,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{
+                AtomicU64,
+                Ordering,
+            },
+        },
+        time::Duration,
+    },
+    tokio::{
+        fs,
+        io::AsyncReadExt,
+        sync::{
+            mpsc,
+            watch,
+        },
+    },
 };
-
-use anyhow::{Context, Result, bail};
-use tokio::{
-    fs,
-    io::AsyncReadExt,
-    sync::{mpsc, watch},
-};
-
-use super::temporary_path;
-use crate::{sftp::RemoteFs, terminal::RuntimeEvent};
 
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 

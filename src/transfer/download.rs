@@ -1,23 +1,36 @@
-use std::{
-    future::Future,
-    path::Path,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+use {
+    super::temporary_path,
+    crate::{
+        sftp::RemoteFs,
+        terminal::RuntimeEvent,
     },
-    time::Duration,
+    anyhow::{
+        Context,
+        Result,
+        bail,
+    },
+    std::{
+        future::Future,
+        path::Path,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{
+                AtomicU64,
+                Ordering,
+            },
+        },
+        time::Duration,
+    },
+    tokio::{
+        fs,
+        io::AsyncWriteExt,
+        sync::{
+            mpsc,
+            watch,
+        },
+    },
 };
-
-use anyhow::{Context, Result, bail};
-use tokio::{
-    fs,
-    io::AsyncWriteExt,
-    sync::{mpsc, watch},
-};
-
-use super::temporary_path;
-use crate::{sftp::RemoteFs, terminal::RuntimeEvent};
 
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -48,13 +61,17 @@ pub async fn download_path(
     if kind.is_some_and(|kind| kind.is_dir()) {
         match fs::symlink_metadata(local).await {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => bail!(
-                "destination exists and is not a directory: {}",
-                local.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(local)
-                .await
-                .with_context(|| format!("creating local directory {}", local.display()))?,
+            Ok(_) => {
+                bail!(
+                    "destination exists and is not a directory: {}",
+                    local.display()
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(local)
+                    .await
+                    .with_context(|| format!("creating local directory {}", local.display()))?
+            }
             Err(error) => return Err(error.into()),
         }
         let mut copied = 0;

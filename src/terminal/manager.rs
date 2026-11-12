@@ -1,16 +1,38 @@
-use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
-    path::Path,
-    sync::mpsc::{self as std_mpsc, SyncSender},
-    thread,
-};
-
 pub use crate::event::RuntimeEvent;
-use anyhow::{Context, Result, anyhow};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::sync::mpsc;
-use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
+use {
+    anyhow::{
+        Context,
+        Result,
+        anyhow,
+    },
+    portable_pty::{
+        Child,
+        CommandBuilder,
+        MasterPty,
+        PtySize,
+        native_pty_system,
+    },
+    std::{
+        collections::BTreeMap,
+        io::{
+            Read,
+            Write,
+        },
+        path::Path,
+        sync::mpsc::{
+            self as std_mpsc,
+            SyncSender,
+        },
+        thread,
+    },
+    tempfile::TempDir,
+    tokio::sync::mpsc,
+    vt100::{
+        MouseProtocolEncoding,
+        MouseProtocolMode,
+        Parser,
+    },
+};
 
 struct TerminalSession {
     id: u64,
@@ -21,6 +43,16 @@ struct TerminalSession {
     input: SyncSender<Vec<u8>>,
     reader_closed: bool,
     exited: bool,
+    remote: Option<RemoteTerminal>,
+}
+
+#[derive(Clone)]
+pub struct RemoteTerminal {
+    pub ssh_host: String,
+    pub control_path: std::path::PathBuf,
+    pub container: Option<String>,
+    pub owner_session_id: u64,
+    _control_dir: std::sync::Arc<TempDir>,
 }
 
 #[derive(Default)]
@@ -39,6 +71,10 @@ impl TerminalManager {
             next_id: 0,
             scrollback,
         }
+    }
+
+    pub fn set_scrollback(&mut self, scrollback: usize) {
+        self.scrollback = scrollback.max(100);
     }
 
     pub fn active_screen(&self) -> Option<&vt100::Screen> {
@@ -62,6 +98,12 @@ impl TerminalManager {
 
     pub fn active_id(&self) -> Option<u64> {
         self.active
+    }
+
+    pub fn active_remote(&self) -> Option<RemoteTerminal> {
+        self.active
+            .and_then(|id| self.sessions.get(&id))
+            .and_then(|session| session.remote.clone())
     }
 
     pub fn active_mouse_mode(&self) -> MouseProtocolMode {
@@ -122,33 +164,93 @@ impl TerminalManager {
         size: PtySize,
         output: mpsc::Sender<RuntimeEvent>,
     ) -> Result<u64> {
+        self.open_ssh_terminal(alias, alias.to_owned(), None, None, size, output)
+    }
+
+    pub fn open_docker(
+        &mut self,
+        config: &crate::config::DockerHostConfig,
+        size: PtySize,
+        output: mpsc::Sender<RuntimeEvent>,
+    ) -> Result<u64> {
+        validate_container_name(&config.container)?;
+        let container = shell_quote(&config.container);
+        let remote_command = match config.shell {
+            crate::config::DockerShell::Auto => {
+                format!(
+                    "if docker exec {container} bash -lc true >/dev/null 2>&1; then exec docker exec -it {container} bash -l; else exec docker exec -it {container} sh; fi"
+                )
+            }
+            crate::config::DockerShell::Bash => format!("docker exec -it {container} bash -l"),
+            crate::config::DockerShell::Sh => format!("docker exec -it {container} sh"),
+        };
+        self.open_ssh_terminal(
+            &config.ssh_host,
+            format!("{}@{}", config.container, config.ssh_host),
+            Some(remote_command),
+            Some(config.container.clone()),
+            size,
+            output,
+        )
+    }
+
+    fn open_ssh_terminal(
+        &mut self,
+        ssh_host: &str,
+        title: String,
+        remote_command: Option<String>,
+        container: Option<String>,
+        size: PtySize,
+        output: mpsc::Sender<RuntimeEvent>,
+    ) -> Result<u64> {
+        let control_dir = std::sync::Arc::new(
+            tempfile::tempdir().context("creating SSH control socket directory")?,
+        );
+        let control_path = control_dir.path().join("s");
         let mut command = CommandBuilder::new("ssh");
-        command.args(["-tt", "--", alias]);
+        command.args(["-tt", "-M", "-S"]);
+        command.arg(&control_path);
+        command.args(["-o", "ControlPersist=no", "--", ssh_host]);
+        if let Some(remote_command) = remote_command {
+            command.arg(remote_command);
+        }
         command.env("TERM", "xterm-256color");
-        self.open(command, alias.to_owned(), size, output)
+        self.open_with_remote(
+            command,
+            title,
+            size,
+            output,
+            Some(RemoteTerminal {
+                ssh_host: ssh_host.to_owned(),
+                control_path,
+                container,
+                owner_session_id: 0,
+                _control_dir: control_dir,
+            }),
+        )
     }
 
     pub fn open_editor(
         &mut self,
         editor: &[String],
         path: &Path,
-        remote: Option<&str>,
+        remote: Option<&RemoteTerminal>,
         size: PtySize,
         output: mpsc::Sender<RuntimeEvent>,
     ) -> Result<u64> {
         let Some(program) = editor.first() else {
             return Err(anyhow!("terminal.editor must contain an executable"));
         };
-        let (command, title) = match remote {
+        let (command, title, remote_target) = match remote {
             None => {
                 let mut command = CommandBuilder::new(program);
                 command.args(&editor[1..]);
                 command.arg("--");
                 command.arg(path);
                 command.env("TERM", "xterm-256color");
-                (command, format!("{} — {}", program, path.display()))
+                (command, format!("{} — {}", program, path.display()), None)
             }
-            Some(alias) => {
+            Some(remote) => {
                 let mut args = editor
                     .iter()
                     .map(|arg| shell_quote(arg))
@@ -157,13 +259,51 @@ impl TerminalManager {
                 args.push(shell_quote(&path.to_string_lossy()));
                 let remote_command = format!("exec {}", args.join(" "));
                 let mut command = CommandBuilder::new("ssh");
-                command.args(["-tt", "--", alias]);
+                command.args(["-tt", "-S"]);
+                command.arg(&remote.control_path);
+                command.args(["--", remote.ssh_host.as_str()]);
                 command.arg(remote_command);
                 command.env("TERM", "xterm-256color");
-                (command, format!("{}:{}", alias, path.display()))
+                (
+                    command,
+                    format!("{}:{}", remote.ssh_host, path.display()),
+                    Some(remote.clone()),
+                )
             }
         };
-        self.open(command, title, size, output)
+        self.open_with_remote(command, title, size, output, remote_target)
+    }
+
+    pub fn open_docker_editor(
+        &mut self,
+        editor: &[String],
+        path: &Path,
+        remote: &RemoteTerminal,
+        size: PtySize,
+        output: mpsc::Sender<RuntimeEvent>,
+    ) -> Result<u64> {
+        let Some(container) = remote.container.as_deref() else {
+            anyhow::bail!("Docker editor requires a container session");
+        };
+        validate_container_name(container)?;
+        let mut args = vec!["docker".to_owned(), "exec".into(), "-it".into()];
+        args.push(shell_quote(container));
+        args.extend(editor.iter().map(|arg| shell_quote(arg)));
+        args.push("--".into());
+        args.push(shell_quote(&path.to_string_lossy()));
+        let mut command = CommandBuilder::new("ssh");
+        command.args(["-tt", "-S"]);
+        command.arg(&remote.control_path);
+        command.args(["--", remote.ssh_host.as_str()]);
+        command.arg(args.join(" "));
+        command.env("TERM", "xterm-256color");
+        self.open_with_remote(
+            command,
+            format!("{}@{}:{}", container, remote.ssh_host, path.display()),
+            size,
+            output,
+            Some(remote.clone()),
+        )
     }
 
     fn open(
@@ -172,6 +312,17 @@ impl TerminalManager {
         title: String,
         size: PtySize,
         output: mpsc::Sender<RuntimeEvent>,
+    ) -> Result<u64> {
+        self.open_with_remote(command, title, size, output, None)
+    }
+
+    fn open_with_remote(
+        &mut self,
+        command: CommandBuilder,
+        title: String,
+        size: PtySize,
+        output: mpsc::Sender<RuntimeEvent>,
+        mut remote: Option<RemoteTerminal>,
     ) -> Result<u64> {
         let pty = native_pty_system().openpty(size)?;
         let child = pty
@@ -189,6 +340,11 @@ impl TerminalManager {
             .context("opening PTY input stream")?;
         let id = self.next_id.wrapping_add(1).max(1);
         self.next_id = id;
+        if let Some(remote) = remote.as_mut()
+            && remote.owner_session_id == 0
+        {
+            remote.owner_session_id = id;
+        }
         let (input, input_rx) = std_mpsc::sync_channel::<Vec<u8>>(16);
         thread::Builder::new()
             .name(format!("fpsxterm-pty-writer-{id}"))
@@ -210,6 +366,7 @@ impl TerminalManager {
                 input,
                 reader_closed: false,
                 exited: false,
+                remote,
             },
         );
         self.active = Some(id);
@@ -262,6 +419,9 @@ impl TerminalManager {
             RuntimeEvent::TransferStarted { .. } => {}
             RuntimeEvent::FileOperationFinished { .. } => {}
             RuntimeEvent::FilePreviewLoaded { .. } => {}
+            RuntimeEvent::HostConnectionTested { .. } => {}
+            RuntimeEvent::FormConnectionTested { .. } => {}
+            RuntimeEvent::DockerContainersLoaded { .. } => {}
         }
     }
 
@@ -372,6 +532,18 @@ fn reader_loop(
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn validate_container_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!("container name contains unsupported characters");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

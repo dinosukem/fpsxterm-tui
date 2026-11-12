@@ -1,14 +1,26 @@
-use std::{
-    collections::HashSet,
-    fs,
-    io::Write,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+use {
+    super::host::{
+        HostSource,
+        ManagedHost,
+        SshHost,
+    },
+    anyhow::{
+        Context,
+        Result,
+        bail,
+    },
+    glob::glob,
+    std::{
+        collections::HashSet,
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        path::{
+            Path,
+            PathBuf,
+        },
+    },
 };
-
-use super::host::{HostSource, ManagedHost, SshHost};
-use anyhow::{Context, Result, bail};
-use glob::glob;
 
 const INCLUDE_PATH: &str = "~/.ssh/fpsxterm-tui/hosts.conf";
 const MANAGED_HEADER: &str = "# Managed by fpsxterm-tui. Edit hosts through the application.";
@@ -389,6 +401,7 @@ fn parse_host(alias: &str, path: &Path, source: HostSource) -> Result<SshHost> {
         port: None,
         identity_file: None,
         source,
+        docker: None,
     };
     for line in text.lines() {
         let Some((key, value)) = parse_key_value(line) else {
@@ -431,6 +444,10 @@ fn validate_host(host: &ManagedHost) -> Result<()> {
         validate_value("IdentityFile", &path.to_string_lossy())?;
     }
     Ok(())
+}
+
+pub fn validate_candidate(host: &ManagedHost) -> Result<()> {
+    validate_host(host)
 }
 
 fn validate_alias(alias: &str) -> Result<()> {

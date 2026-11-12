@@ -1,9 +1,16 @@
-use std::{
-    path::{Path, PathBuf},
-    time::SystemTime,
+use {
+    anyhow::{
+        Result,
+        bail,
+    },
+    std::{
+        path::{
+            Path,
+            PathBuf,
+        },
+        time::SystemTime,
+    },
 };
-
-use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {

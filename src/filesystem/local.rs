@@ -1,8 +1,20 @@
-use std::path::{Path, PathBuf};
-
-use super::{EntryKind, FileEntry, safe_child};
-use anyhow::{Context, Result, bail};
-use tokio::fs;
+use {
+    super::{
+        EntryKind,
+        FileEntry,
+        safe_child,
+    },
+    anyhow::{
+        Context,
+        Result,
+        bail,
+    },
+    std::path::{
+        Path,
+        PathBuf,
+    },
+    tokio::fs,
+};
 
 pub async fn list_local(path: &Path) -> Result<Vec<FileEntry>> {
     let mut dir = fs::read_dir(path)

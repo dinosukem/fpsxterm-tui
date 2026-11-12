@@ -1,15 +1,35 @@
-use std::{
-    future::Future,
-    path::{Path, PathBuf},
-    time::{Duration, UNIX_EPOCH},
+use {
+    crate::filesystem::{
+        EntryKind,
+        FileEntry,
+        safe_child,
+    },
+    anyhow::{
+        Context,
+        Result,
+        bail,
+    },
+    futures_util::TryStreamExt,
+    openssh::{
+        KnownHosts,
+        Session,
+    },
+    openssh_sftp_client::{
+        Sftp,
+        SftpOptions,
+    },
+    std::{
+        future::Future,
+        path::{
+            Path,
+            PathBuf,
+        },
+        time::{
+            Duration,
+            UNIX_EPOCH,
+        },
+    },
 };
-
-use anyhow::{Context, Result, bail};
-use futures_util::TryStreamExt;
-use openssh::{KnownHosts, Session};
-use openssh_sftp_client::{Sftp, SftpOptions};
-
-use crate::filesystem::{EntryKind, FileEntry, safe_child};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,6 +72,28 @@ impl RemoteFs {
         .await
         .context("timed out starting SFTP subsystem")?
         .with_context(|| format!("starting SFTP subsystem for {alias}"))?;
+        Ok(Self { sftp })
+    }
+
+    pub async fn connect_control(control_path: &Path, alias: &str) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        while !control_path.exists() {
+            if tokio::time::Instant::now() >= deadline {
+                bail!("SSH terminal session for {alias} is not connected yet");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let session = std::sync::Arc::new(Session::resume(
+            control_path.to_path_buf().into_boxed_path(),
+            None,
+        ));
+        let sftp = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            Sftp::from_clonable_session(session, SftpOptions::default()),
+        )
+        .await
+        .context("timed out starting SFTP on the active terminal SSH session")?
+        .with_context(|| format!("starting SFTP subsystem for active session {alias}"))?;
         Ok(Self { sftp })
     }
 
@@ -178,9 +220,11 @@ impl RemoteFs {
                 for entry in self.list(&directory).await? {
                     match entry.kind {
                         EntryKind::Directory => pending.push(entry.path),
-                        _ => request(self.sftp.fs().remove_file(&entry.path))
-                            .await
-                            .context("deleting remote file or symbolic link")?,
+                        _ => {
+                            request(self.sftp.fs().remove_file(&entry.path))
+                                .await
+                                .context("deleting remote file or symbolic link")?
+                        }
                     }
                 }
             }

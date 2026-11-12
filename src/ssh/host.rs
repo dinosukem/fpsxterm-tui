@@ -1,11 +1,16 @@
-use std::path::PathBuf;
-
-use serde::{Deserialize, Serialize};
+use {
+    serde::{
+        Deserialize,
+        Serialize,
+    },
+    std::path::PathBuf,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostSource {
     Managed,
     OpenSsh,
+    Docker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +21,7 @@ pub struct SshHost {
     pub port: Option<u16>,
     pub identity_file: Option<PathBuf>,
     pub source: HostSource,
+    pub docker: Option<crate::config::DockerHostConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,13 +1,26 @@
 use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
 };
 
+mod docker;
 mod download;
 mod upload;
 
-pub use download::download_path;
-pub use upload::upload_path;
+pub use {
+    docker::{
+        download_path as download_docker_path,
+        upload_path as upload_docker_path,
+    },
+    download::download_path,
+    upload::upload_path,
+};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
