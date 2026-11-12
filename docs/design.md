@@ -397,6 +397,12 @@ Khi thêm hoặc sửa host:
 
 File cấu hình phải được giới hạn quyền truy cập thích hợp.
 
+Workspace Hosts có `Test connection` chạy nền với BatchMode và timeout 10 giây, giữ nguyên xác minh `known_hosts` và không yêu cầu nhập mật khẩu trong TUI. Docker container được lưu trong `config.toml` dưới dạng `[[docker_hosts]]`, gắn với SSH alias, container name và shell `auto`, `bash` hoặc `sh`.
+
+Danh sách Hosts hiển thị Docker host thành các dòng con của SSH host tương ứng. Có thể thu gọn/mở nhóm bằng `←`/`→` hoặc click biểu tượng disclosure; cuộn chuột đi từng dòng đang hiển thị. Chỉnh sửa SSH host được quản lý sẽ cập nhật SSH alias tham chiếu của Docker con. Xóa SSH host yêu cầu xác nhận và đồng thời xóa cấu hình Docker con khỏi ứng dụng; không xóa container trên máy chủ từ xa và không làm gián đoạn terminal session đang chạy. Các nguồn kết quả của Hosts (test, import, list, add/edit/delete) hiển thị trong `Host Details`.
+
+Host do ứng dụng quản lý có metadata `created_at` và `updated_at` (Unix timestamp) trong `config.toml`; UI hiển thị theo múi giờ Việt Nam. Host cũ chưa có metadata hiển thị `Không rõ`. OpenSSH host chỉ đọc không nhận metadata cho tới khi được import.
+
 ---
 
 # 6. Terminal Emulator
@@ -513,11 +519,13 @@ docker ps
 
 Khi đang sử dụng Terminal:
 
-- Phím bình thường chuyển đến PTY.
+- Phím bình thường chuyển đến PTY; `Ctrl+T` được giao diện giữ lại để kiểm tra host đang chọn trong Hosts.
 - Terminal resize cập nhật kích thước PTY.
 - Click vào terminal để nhận focus.
 - Mouse events được chuyển đến ứng dụng bên trong nếu ứng dụng đó bật mouse reporting.
 - `Ctrl+]` trả quyền điều khiển về giao diện chính.
+
+Phím tắt workspace dùng `Alt+H` Hosts, `Alt+Shift+H` History, `Alt+T` Terminal, `Alt+Shift+T` Transfers, `Alt+F` Files và `Alt+C` Configuration; `Alt+←/→` đi tuần tự. `Tab` không dùng để đổi workspace.
 
 Terminal cần xử lý đúng các chuỗi điều khiển, phím chức năng và các chế độ nhập của chương trình bên trong.
 
@@ -575,6 +583,8 @@ Hỗ trợ:
 Sử dụng SFTP để thực hiện các thao tác tương tự trên máy chủ.
 
 Hai panel dùng chung một giao diện dữ liệu, nhưng backend thực thi khác nhau.
+
+Files chỉ tải dữ liệu khi có terminal session active. SSH session dùng chung OpenSSH control socket của terminal; Docker session chạy file operations và truyền file qua `docker exec` trên SSH host. Nếu container thiếu tiện ích cần thiết, giao diện báo danh sách và gợi ý lệnh cài theo package manager, không tự cài. Local terminal chỉ có pane local. Mỗi session giữ đường dẫn local và remote riêng; lệnh `cd` trong terminal không đổi đường dẫn Files.
 
 ```text
              FILE MANAGER
@@ -649,7 +659,8 @@ Double-click được phát hiện bằng thời gian giữa hai lần click li�
 | **F5**           | **Refresh panel**           |
 | F6               | Transfer sang panel còn lại |
 | F7               | Create folder               |
-| Enter            | Open file/folder            |
+| Enter            | Open folder / view file     |
+| Ctrl+Enter       | Edit file with configured editor |
 | Backspace        | Parent directory            |
 | ↑ / ↓            | Move selection cursor       |
 | PageUp/PageDown  | Scroll                      |
@@ -1252,8 +1263,21 @@ confirm_overwrite = true
 max_concurrent = 2
 ```
 
-Đây là cấu hình nội bộ của ứng dụng, không thay thế `~/.ssh/config`.
+Ví dụ Docker container host (có thể lặp lại cho nhiều container):
+
+```toml
+[[docker_hosts]]
+ssh_host = "production"
+container = "web"
+shell = "auto" # auto, bash hoặc sh
+```
+
+Đây là cấu hình nội bộ của ứng dụng, không thay thế `~/.ssh/config`. Workspace Configuration cung cấp form cho các nhóm trên (Docker hosts vẫn được quản lý ở Hosts); `Ctrl+S` kiểm tra, ghi atomically rồi đọc lại cấu hình. UI và giới hạn transfer áp dụng ngay; session terminal đang chạy và transfer hiện tại tiếp tục, các cấu hình shell/editor/scrollback áp dụng cho session mới. Theme hiện chỉ hỗ trợ `dark`.
+
+Cuộn chuột trong Files tác động lên pane nằm dưới con trỏ; trong Hosts và Configuration, mỗi nấc di chuyển đúng một dòng hoặc trường. Configuration hỗ trợ highlight khi hover và click để chọn trường; cuộn chỉ đổi trường đang chọn, còn sửa đổi chỉ xảy ra khi người dùng bật chế độ chỉnh sửa.
 Nếu chưa có file, ứng dụng tự tạo `config.toml` với các giá trị mặc định ở thư mục cấu hình XDG. File được ghi với quyền chỉ chủ sở hữu đọc/ghi trên Unix; ứng dụng từ chối đọc hoặc thay thế file cấu hình qua symbolic link.
+
+Khi thêm hoặc sửa SSH/Docker host, `Ctrl+T` kiểm tra chính các giá trị đang nhập nhưng là tùy chọn; host vẫn có thể lưu khi chưa test hoặc test thất bại. Mọi thay đổi trường dữ liệu sẽ xóa trạng thái thành công cũ để tránh hiển thị kết quả không còn khớp với cấu hình.
 
 ---
 
@@ -1544,6 +1568,9 @@ Triển khai:
 | AC-18 | Recovery          | Xử lý được lỗi kết nối và file operation         |
 | AC-19 | Cleanup           | Khôi phục terminal khi thoát                     |
 | AC-20 | Mouse Transfer    | Internal drag-and-drop trên terminal tương thích |
+| AC-21 | Docker Files      | Remote file operations và transfer qua `docker exec` |
+| AC-22 | Config Workspace  | Chỉnh, lưu atomically và reload cấu hình từ TUI |
+| AC-23 | Host Test         | Test kết nối là tùy chọn; kết quả hiển thị ở Host Details |
 
 ---
 
