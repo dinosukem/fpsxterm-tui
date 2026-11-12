@@ -1541,6 +1541,20 @@ impl App {
     }
 }
 
+fn read_history(path: &std::path::Path) -> Vec<HistoryEntry> {
+    let mut history = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<HistoryFile>(&text).ok())
+        .map(|file| file.entries)
+        .unwrap_or_default();
+    for item in &mut history {
+        if item.status == "Started" {
+            item.status = "Interrupted (previous run)".into();
+        }
+    }
+    history
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1563,18 +1577,4 @@ mod tests {
         app.update(Action::NextScreen);
         assert_eq!(app.screen, Screen::Hosts);
     }
-}
-
-fn read_history(path: &std::path::Path) -> Vec<HistoryEntry> {
-    let mut history = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| toml::from_str::<HistoryFile>(&text).ok())
-        .map(|file| file.entries)
-        .unwrap_or_default();
-    for item in &mut history {
-        if item.status == "Started" {
-            item.status = "Interrupted (previous run)".into();
-        }
-    }
-    history
 }

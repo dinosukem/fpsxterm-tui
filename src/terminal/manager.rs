@@ -6,45 +6,11 @@ use std::{
     thread,
 };
 
+pub use crate::event::RuntimeEvent;
 use anyhow::{Context, Result, anyhow};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
-
-#[derive(Debug, Clone)]
-pub enum RuntimeEvent {
-    Output {
-        session_id: u64,
-        bytes: Vec<u8>,
-    },
-    ReaderClosed {
-        session_id: u64,
-    },
-    FilesLoaded {
-        side: crate::app::FilePanel,
-        path: std::path::PathBuf,
-        entries: Result<Vec<crate::filesystem::FileEntry>, String>,
-    },
-    TransferFinished {
-        id: u64,
-        result: Result<u64, String>,
-    },
-    TransferProgress {
-        id: u64,
-        bytes: u64,
-    },
-    TransferStarted {
-        id: u64,
-    },
-    FileOperationFinished {
-        side: crate::app::FilePanel,
-        message: Result<String, String>,
-    },
-    FilePreviewLoaded {
-        title: String,
-        content: Result<String, String>,
-    },
-}
 
 struct TerminalSession {
     id: u64,
@@ -317,13 +283,18 @@ impl TerminalManager {
                 }
             }
         }
-        if let Some(id) = self.active
-            && self
-                .sessions
-                .get(&id)
-                .is_some_and(|s| s.reader_closed && s.exited)
-        {
+        let finished = self
+            .sessions
+            .iter()
+            .filter_map(|(&id, session)| (session.reader_closed && session.exited).then_some(id))
+            .collect::<Vec<_>>();
+        for id in finished {
             self.sessions.remove(&id);
+        }
+        if self
+            .active
+            .is_some_and(|id| !self.sessions.contains_key(&id))
+        {
             self.active = self.sessions.keys().next_back().copied();
         }
         exited
@@ -333,10 +304,10 @@ impl TerminalManager {
         let id = self
             .active
             .ok_or_else(|| anyhow!("no active terminal session"))?;
-        if let Some(mut session) = self.sessions.remove(&id)
+        if let Some(session) = self.sessions.remove(&id)
             && !session.exited
         {
-            let _ = session.child.kill();
+            kill_and_reap(id, session.child);
         }
         self.active = self.sessions.keys().next_back().copied();
         Ok(())
@@ -345,12 +316,21 @@ impl TerminalManager {
 
 impl Drop for TerminalManager {
     fn drop(&mut self) {
-        for session in self.sessions.values_mut() {
+        for (id, session) in std::mem::take(&mut self.sessions) {
             if !session.exited {
-                let _ = session.child.kill();
+                kill_and_reap(id, session.child);
             }
         }
     }
+}
+
+fn kill_and_reap(id: u64, mut child: Box<dyn Child + Send + Sync>) {
+    let _ = child.kill();
+    let _ = thread::Builder::new()
+        .name(format!("fpsxterm-pty-reaper-{id}"))
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn writer_loop(mut writer: Box<dyn Write + Send>, input: std_mpsc::Receiver<Vec<u8>>) {

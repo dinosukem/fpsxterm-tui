@@ -1,27 +1,8 @@
-use std::{
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::path::{Path, PathBuf};
 
+use super::{EntryKind, FileEntry, safe_child};
 use anyhow::{Context, Result, bail};
 use tokio::fs;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    File,
-    Directory,
-    Symlink,
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileEntry {
-    pub name: String,
-    pub path: PathBuf,
-    pub kind: EntryKind,
-    pub size: Option<u64>,
-    pub modified: Option<SystemTime>,
-}
 
 pub async fn list_local(path: &Path) -> Result<Vec<FileEntry>> {
     let mut dir = fs::read_dir(path)
@@ -87,20 +68,6 @@ pub async fn delete_local(path: &Path) -> Result<()> {
     .with_context(|| format!("deleting {}", path.display()))
 }
 
-pub fn safe_child(parent: &Path, name: &str) -> Result<PathBuf> {
-    let name = name.trim();
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.chars().any(char::is_control)
-    {
-        bail!("enter a single valid file name")
-    }
-    Ok(parent.join(name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,9 +83,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         tokio::fs::write(&target, "data").await.unwrap();
+        tokio::fs::write(dir.path().join(".hidden"), "hidden")
+            .await
+            .unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
         let entries = list_local(dir.path()).await.unwrap();
+        assert!(entries.iter().any(|entry| entry.name == ".hidden"));
         #[cfg(unix)]
         assert_eq!(
             entries.iter().find(|e| e.name == "link").unwrap().kind,
